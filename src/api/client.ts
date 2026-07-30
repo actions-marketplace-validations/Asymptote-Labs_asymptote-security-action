@@ -9,12 +9,24 @@ import {
 const INITIAL_DELAY_MS = 1000;
 const BACKOFF_MULTIPLIER = 1.5;
 const MAX_DELAY_MS = 10000;
-const MAX_ATTEMPTS = 30;
-const TIMEOUT_MS = 120000;
+const MAX_ATTEMPTS = 150;
+const TIMEOUT_MS = 1200000;
 
 interface ClientOptions {
   apiKey: string;
   baseUrl: string;
+}
+
+export interface RepositoryIntegrationModeResponse {
+  repository_id: string | null;
+  found: boolean;
+  integration_mode: 'legacy_action' | 'github_app';
+}
+
+export function shouldSkipLegacyActionForIntegration(
+  integration: RepositoryIntegrationModeResponse
+): boolean {
+  return integration.found && integration.integration_mode === 'github_app';
 }
 
 export class AsymptoteClient {
@@ -144,6 +156,17 @@ export class AsymptoteClient {
       );
       return [];
     }
+  }
+
+  async getRepositoryIntegrationMode(
+    owner: string,
+    name: string
+  ): Promise<RepositoryIntegrationModeResponse> {
+    const params = new URLSearchParams({ owner, name });
+    return this.request<RepositoryIntegrationModeResponse>(
+      'GET',
+      `/api/repository-integration-mode?${params.toString()}`
+    );
   }
 
   private sleep(ms: number): Promise<void> {

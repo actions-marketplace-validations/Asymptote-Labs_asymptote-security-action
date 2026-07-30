@@ -3,7 +3,6 @@ import * as github from '@actions/github';
 import { Severity, Violation, GetEvaluationResponse } from '../api/types';
 import {
   countBySeverity,
-  shouldFail,
   getSeverityBadge,
 } from '../utils/severity';
 
@@ -29,22 +28,20 @@ interface Annotation {
 export async function createCheckRun(
   octokit: Octokit,
   result: GetEvaluationResponse,
-  commitSha: string,
-  failOnThreshold: Severity
+  commitSha: string
 ): Promise<void> {
   const { owner, repo } = github.context.repo;
 
   const violations = result.violations || [];
   const decision = result.decision || 'allow';
 
-  const shouldFailCheck = shouldFail(violations, failOnThreshold);
-  const conclusion = shouldFailCheck ? 'failure' : 'success';
+  const conclusion = violations.length > 0 ? 'failure' : 'success';
 
   // Build annotations from violations
   const annotations = buildAnnotations(violations);
 
   // Build summary text
-  const summaryText = buildSummaryText(violations, decision, failOnThreshold);
+  const summaryText = buildSummaryText(violations, decision);
 
   core.info(
     `Creating check run with ${annotations.length} annotations (conclusion: ${conclusion})`
@@ -66,6 +63,24 @@ export async function createCheckRun(
         annotations: annotations.slice(0, MAX_ANNOTATIONS_PER_REQUEST),
       },
     });
+
+    // Set details_url to the check run's own page so "View details" links work
+    // on inline annotations in the PR diff view. We need the check run ID first,
+    // so this must be done as an update after creation.
+    if (checkRun.data.html_url) {
+      try {
+        await octokit.rest.checks.update({
+          owner,
+          repo,
+          check_run_id: checkRun.data.id,
+          details_url: checkRun.data.html_url,
+        });
+      } catch (e) {
+        core.warning(
+          `Failed to set details_url: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+    }
 
     // If we have more annotations, update the check run in batches
     if (annotations.length > MAX_ANNOTATIONS_PER_REQUEST) {
@@ -116,7 +131,6 @@ async function addRemainingAnnotations(
 function buildAnnotations(violations: Violation[]): Annotation[] {
   return violations
     .filter((v) => v.location.file && v.location.line_start > 0)
-    .filter((v) => v.severity !== 'low' && v.severity !== 'info')
     .map((violation) => ({
       path: violation.location.file,
       start_line: violation.location.line_start,
@@ -192,8 +206,7 @@ function getCheckTitle(violations: Violation[]): string {
  */
 function buildSummaryText(
   violations: Violation[],
-  decision: string,
-  failOnThreshold: Severity
+  decision: string
 ): string {
   const lines: string[] = [];
 
@@ -220,12 +233,6 @@ function buildSummaryText(
   lines.push(`| **Total** | **${violations.length}** |`);
   lines.push('');
 
-  // Threshold info
-  lines.push(
-    `*Check fails on violations of severity \`${failOnThreshold}\` or higher*`
-  );
-  lines.push('');
-
   // Violations details (limited)
   if (violations.length > 0) {
     lines.push('### Details');
@@ -246,12 +253,6 @@ function buildSummaryText(
       );
     }
   }
-
-  lines.push('');
-  lines.push('---');
-  lines.push(
-    '*Powered by [Asymptote Security](https://asymptotelabs.ai)*'
-  );
 
   return lines.join('\n');
 }

@@ -26,6 +26,7 @@ export interface EvaluationContext {
   generation_id?: string;
   pr_number?: number;
   commit_sha?: string;
+  pr_author?: string;
 }
 
 export interface EvaluateDiffRequest {
@@ -45,6 +46,7 @@ export interface ViolationLocation {
   file: string;
   line_start: number;
   line_end: number;
+  side?: 'LEFT' | 'RIGHT';
 }
 
 export interface ViolationMetadata {
@@ -66,6 +68,7 @@ export interface Violation {
   id: string;
   policy_id: string | null;
   policy_name: string;
+  title?: string;
   category: string;
   severity: Severity;
   enforcement: string;

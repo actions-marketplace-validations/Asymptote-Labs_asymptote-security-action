@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="149" height="28" viewBox="0 0 149 28" role="img" aria-label="View in Dashboard">
+  <rect width="149" height="28" rx="6" fill="#111827"/>
+  <rect x="0.5" y="0.5" width="148" height="27" rx="5.5" fill="none" stroke="#374151"/>
+  <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAABs0lEQVQoFYVSPUsDQRDdnd3c5WLQ1CJRELUS7CwExY9Gkso/aSUICikstBCxEAI2Eaz8JpFIUEnIXXbXN3uXaNJ4zB23u2/eezOz8qDyaq0Tjl/+8oMv/wgxWqYAK6XUQJtkIH5xjB7LFLy0vOnCICAsJtFYc0CTw5+yvBakhCI+yzx47ollpuy0kFooJYgVRgniP7SWpJnC5zDa2jg21lqd4yrxj718TmnJ3N4SJwydoDBn1zeKUSSvLztJ4rZ2StLJ+tW3NKQJCZwmq3v3Jk5A2O+b/WppukSvT/3F5bw17u0pni7qQKuTw3YUaFYIcuQteVfWlhfC87OP0+NWYUqV56PaUfui1pmdCwOlgE5DVnbvBn0o2CQ2q2tTm9sz31+D5ksS99zSSiEMVeOmW7/sRjn4UQo6XoH7Dcnb+ufzY7cQqveXgXL00IjJUadpUjQUCDpcdDYdq5X4+jA94UKNzlCnZbQQec3cmR+fwB1MK+HpkO8g+g0Qd4anm6KxI7mS7J5g8tkseTpD0F809gUreD+ew3MzR0Y5gQbG4RQ3FncQZzxLCQNjgSoRcAJuoInUD/ILZ3qnCkJ1AAAAAElFTkSuQmCC" x="10" y="6" width="16" height="16" preserveAspectRatio="xMidYMid meet"/>
+  <text x="33" y="18" fill="#F9FAFB" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600">View in Dashboard</text>
+</svg>

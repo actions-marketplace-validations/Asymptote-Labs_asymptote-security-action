@@ -31453,12 +31453,16 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.TimeoutError = exports.RateLimitError = exports.AsymptoteClient = void 0;
+exports.shouldSkipLegacyActionForIntegration = shouldSkipLegacyActionForIntegration;
 const core = __importStar(__nccwpck_require__(7484));
 const INITIAL_DELAY_MS = 1000;
 const BACKOFF_MULTIPLIER = 1.5;
 const MAX_DELAY_MS = 10000;
-const MAX_ATTEMPTS = 30;
-const TIMEOUT_MS = 120000;
+const MAX_ATTEMPTS = 150;
+const TIMEOUT_MS = 1200000;
+function shouldSkipLegacyActionForIntegration(integration) {
+    return integration.found && integration.integration_mode === 'github_app';
+}
 class AsymptoteClient {
     apiKey;
     baseUrl;
@@ -31535,6 +31539,10 @@ class AsymptoteClient {
             return [];
         }
     }
+    async getRepositoryIntegrationMode(owner, name) {
+        const params = new URLSearchParams({ owner, name });
+        return this.request('GET', `/api/repository-integration-mode?${params.toString()}`);
+    }
     sleep(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
     }
@@ -31599,7 +31607,6 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getConfig = getConfig;
 const core = __importStar(__nccwpck_require__(7484));
-const severity_1 = __nccwpck_require__(5278);
 /**
  * Parse and validate action inputs
  */
@@ -31610,20 +31617,14 @@ function getConfig() {
     }
     const apiUrl = core.getInput('asymptote_api_url') ||
         'https://asymptote-edge-579124726252.us-west1.run.app';
-    const failOnInput = core.getInput('fail_on') || 'high';
-    const commentOnInput = core.getInput('comment_on') || 'high';
     const excludePathsInput = core.getInput('exclude_paths') || '';
     const excludePaths = excludePathsInput
         .split(',')
         .map((p) => p.trim())
         .filter((p) => p.length > 0);
-    const failOn = (0, severity_1.parseSeverity)(failOnInput);
-    const commentOn = (0, severity_1.parseSeverity)(commentOnInput);
     return {
         apiKey,
         apiUrl,
-        failOn,
-        commentOn,
         excludePaths,
     };
 }
@@ -31679,16 +31680,15 @@ const MAX_ANNOTATIONS_PER_REQUEST = 50;
 /**
  * Create a check run with annotations for the evaluation results
  */
-async function createCheckRun(octokit, result, commitSha, failOnThreshold) {
+async function createCheckRun(octokit, result, commitSha) {
     const { owner, repo } = github.context.repo;
     const violations = result.violations || [];
     const decision = result.decision || 'allow';
-    const shouldFailCheck = (0, severity_1.shouldFail)(violations, failOnThreshold);
-    const conclusion = shouldFailCheck ? 'failure' : 'success';
+    const conclusion = violations.length > 0 ? 'failure' : 'success';
     // Build annotations from violations
     const annotations = buildAnnotations(violations);
     // Build summary text
-    const summaryText = buildSummaryText(violations, decision, failOnThreshold);
+    const summaryText = buildSummaryText(violations, decision);
     core.info(`Creating check run with ${annotations.length} annotations (conclusion: ${conclusion})`);
     try {
         // Create the check run
@@ -31706,6 +31706,22 @@ async function createCheckRun(octokit, result, commitSha, failOnThreshold) {
                 annotations: annotations.slice(0, MAX_ANNOTATIONS_PER_REQUEST),
             },
         });
+        // Set details_url to the check run's own page so "View details" links work
+        // on inline annotations in the PR diff view. We need the check run ID first,
+        // so this must be done as an update after creation.
+        if (checkRun.data.html_url) {
+            try {
+                await octokit.rest.checks.update({
+                    owner,
+                    repo,
+                    check_run_id: checkRun.data.id,
+                    details_url: checkRun.data.html_url,
+                });
+            }
+            catch (e) {
+                core.warning(`Failed to set details_url: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
         // If we have more annotations, update the check run in batches
         if (annotations.length > MAX_ANNOTATIONS_PER_REQUEST) {
             await addRemainingAnnotations(octokit, checkRun.data.id, annotations.slice(MAX_ANNOTATIONS_PER_REQUEST));
@@ -31741,7 +31757,6 @@ async function addRemainingAnnotations(octokit, checkRunId, annotations) {
 function buildAnnotations(violations) {
     return violations
         .filter((v) => v.location.file && v.location.line_start > 0)
-        .filter((v) => v.severity !== 'low' && v.severity !== 'info')
         .map((violation) => ({
         path: violation.location.file,
         start_line: violation.location.line_start,
@@ -31807,7 +31822,7 @@ function getCheckTitle(violations) {
 /**
  * Build summary markdown text
  */
-function buildSummaryText(violations, decision, failOnThreshold) {
+function buildSummaryText(violations, decision) {
     const lines = [];
     // Decision badge
     const decisionBadges = {
@@ -31830,9 +31845,6 @@ function buildSummaryText(violations, decision, failOnThreshold) {
     lines.push(`| ${(0, severity_1.getSeverityBadge)('low')} | ${counts.low} |`);
     lines.push(`| **Total** | **${violations.length}** |`);
     lines.push('');
-    // Threshold info
-    lines.push(`*Check fails on violations of severity \`${failOnThreshold}\` or higher*`);
-    lines.push('');
     // Violations details (limited)
     if (violations.length > 0) {
         lines.push('### Details');
@@ -31847,9 +31859,6 @@ function buildSummaryText(violations, decision, failOnThreshold) {
             lines.push(`*...and ${violations.length - 10} more. See annotations for full details.*`);
         }
     }
-    lines.push('');
-    lines.push('---');
-    lines.push('*Powered by [Asymptote Security](https://asymptotelabs.ai)*');
     return lines.join('\n');
 }
 
@@ -31896,30 +31905,34 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.postViolationComments = postViolationComments;
+exports.formatViolationComment = formatViolationComment;
+exports.resolveOutdatedThreads = resolveOutdatedThreads;
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const severity_1 = __nccwpck_require__(5278);
+function buildReviewSummary(commentCount) {
+    const label = commentCount === 1 ? 'vulnerability' : 'vulnerabilities';
+    return `Asymptote security scan has reviewed your changes and found ${commentCount} potential ${label}.`;
+}
 /**
  * Post violation comments as a PR review
  */
-async function postViolationComments(octokit, violations, commitSha, commentThreshold) {
+async function postViolationComments(octokit, violations, commitSha) {
     const { owner, repo } = github.context.repo;
     const prNumber = github.context.payload.pull_request?.number;
     if (!prNumber) {
         core.warning('No PR number found, skipping comment posting');
         return;
     }
-    // Filter violations by threshold
-    const relevantViolations = (0, severity_1.filterByThreshold)(violations, commentThreshold);
-    if (relevantViolations.length === 0) {
-        core.info('No violations meet comment threshold, skipping comments');
+    if (violations.length === 0) {
+        core.info('No violations to comment on');
         return;
     }
-    core.info(`Posting ${relevantViolations.length} violation comments on PR #${prNumber}`);
+    core.info(`Posting ${violations.length} violation comments on PR #${prNumber}`);
     // Build review comments with multi-line support
     // When a suggested fix is present, use its line range so the ```suggestion
     // block replaces exactly the right lines when "Apply suggestion" is clicked.
-    const comments = relevantViolations
+    const comments = violations
         .filter((v) => v.location.file && v.location.line_start > 0)
         .map((violation) => {
         // Determine line range: prefer fix range (accurate for suggestions),
@@ -31935,38 +31948,97 @@ async function postViolationComments(octokit, violations, commitSha, commentThre
         const lineEnd = hasFixRange
             ? fixEnd
             : violation.location.line_end || violation.location.line_start;
+        const side = violation.location.side === 'LEFT' ? 'LEFT' : 'RIGHT';
         const comment = {
             path: violation.location.file,
             line: lineEnd,
             body: formatViolationComment(violation),
+            side,
         };
         // Add multi-line range if spanning multiple lines
         if (lineEnd > lineStart) {
             comment.start_line = lineStart;
-            comment.side = 'RIGHT';
-            comment.start_side = 'RIGHT';
+            comment.start_side = side;
         }
         return comment;
     });
     if (comments.length === 0) {
         core.info('No violations with valid locations to comment on');
-        return;
     }
-    try {
-        await octokit.rest.pulls.createReview({
-            owner,
-            repo,
-            pull_number: prNumber,
-            commit_id: commitSha,
-            event: 'COMMENT',
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            comments: comments,
-        });
-        core.info(`Successfully posted ${comments.length} review comments`);
+    else {
+        try {
+            const reviewResponse = await octokit.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: prNumber,
+                commit_id: commitSha,
+                event: 'COMMENT',
+                body: buildReviewSummary(comments.length),
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                comments: comments,
+            });
+            core.info(`Successfully posted ${comments.length} review comments`);
+            // Add thumbs up/down reactions to each review comment for user feedback
+            try {
+                const reviewId = reviewResponse.data.id;
+                const reviewComments = await octokit.rest.pulls.listCommentsForReview({
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    review_id: reviewId,
+                    per_page: 100,
+                });
+                for (const comment of reviewComments.data) {
+                    try {
+                        await octokit.rest.reactions.createForPullRequestReviewComment({
+                            owner,
+                            repo,
+                            comment_id: comment.id,
+                            content: '+1',
+                        });
+                    }
+                    catch (error) {
+                        core.warning(`Failed to add +1 reaction to review comment ${comment.id}: ${error instanceof Error ? error.message : String(error)}`);
+                    }
+                    try {
+                        await octokit.rest.reactions.createForPullRequestReviewComment({
+                            owner,
+                            repo,
+                            comment_id: comment.id,
+                            content: '-1',
+                        });
+                    }
+                    catch (error) {
+                        core.warning(`Failed to add -1 reaction to review comment ${comment.id}: ${error instanceof Error ? error.message : String(error)}`);
+                    }
+                }
+                core.info(`Added reactions to ${reviewComments.data.length} review comments`);
+            }
+            catch (error) {
+                core.warning(`Failed to add reactions to review comments: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        catch (error) {
+            // Don't fail the action if we can't post comments
+            core.warning(`Failed to post review comments: ${error instanceof Error ? error.message : String(error)}`);
+        }
     }
-    catch (error) {
-        // Don't fail the action if we can't post comments
-        core.warning(`Failed to post review comments: ${error instanceof Error ? error.message : String(error)}`);
+    // Post fallback issue comment for violations without valid locations
+    const locationlessViolations = violations.filter((v) => !v.location.file || v.location.line_start <= 0);
+    if (locationlessViolations.length > 0) {
+        try {
+            const body = formatFallbackComment(locationlessViolations);
+            await octokit.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body,
+            });
+            core.info(`Posted fallback comment for ${locationlessViolations.length} locationless violations`);
+        }
+        catch (error) {
+            core.warning(`Failed to post fallback comment: ${error instanceof Error ? error.message : String(error)}`);
+        }
     }
 }
 /**
@@ -31980,6 +32052,7 @@ function buildSuggestionBlock(suggestedFix) {
 }
 const CURSOR_URL_MAX = 7500;
 const CURSOR_REDIRECT_PREFIX = 'https://asymptotelabs.ai/open/cursor?text=';
+const DASHBOARD_BADGE_URL = 'https://raw.githubusercontent.com/Asymptote-Labs/asymptote-security-action/main/assets/view-in-dashboard-badge.svg';
 /**
  * Build Cursor redirect URL for fixing a violation.
  * GitHub strips non-HTTPS protocols from <a href>, so we use an HTTPS
@@ -32022,58 +32095,159 @@ function escapeHtmlAttr(s) {
 }
 function buildCursorDeeplinkHtml(violation) {
     const url = escapeHtmlAttr(buildCursorRedirectUrl(violation));
-    return `<p><a href="${url}" target="_blank" rel="noopener noreferrer"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cursor.com/assets/images/fix-in-cursor-dark.png"><source media="(prefers-color-scheme: light)" srcset="https://cursor.com/assets/images/fix-in-cursor-light.png"><img alt="Fix in Cursor" width="115" height="28" src="https://cursor.com/assets/images/fix-in-cursor-dark.png"></picture></a></p>`;
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer"><picture style="vertical-align: middle"><source media="(prefers-color-scheme: dark)" srcset="https://cursor.com/assets/images/fix-in-cursor-dark.png"><source media="(prefers-color-scheme: light)" srcset="https://cursor.com/assets/images/fix-in-cursor-light.png"><img alt="Fix in Cursor" width="115" height="28" src="https://cursor.com/assets/images/fix-in-cursor-dark.png" style="vertical-align: middle"></picture></a>`;
+}
+function buildDashboardDeeplinkHtml(violation) {
+    const dashboardUrl = escapeHtmlAttr(`https://asymptotelabs.ai/dashboard/vulnerabilities/violation-${violation.id}`);
+    const badgeUrl = escapeHtmlAttr(DASHBOARD_BADGE_URL);
+    return `<a href="${dashboardUrl}" target="_blank" rel="noopener noreferrer"><img alt="View in Dashboard" width="149" height="28" src="${badgeUrl}" style="vertical-align: middle"></a>`;
 }
 /**
  * Format a violation as a markdown comment
  */
 function formatViolationComment(violation) {
     const lines = [];
-    // Header with severity badge
-    lines.push(`### ${(0, severity_1.getSeverityBadge)(violation.severity)} Security Issue`);
+    // Header with logo and title
+    const title = capitalizeFirstCharacter(violation.title || violation.message);
+    lines.push(`<h3><img src="https://asymptotelabs.ai/logo.png" alt="Asymptote" width="20" height="20" align="absmiddle"> Asymptote Security Scan — ${escapeHtml(title)}</h3>`);
     lines.push('');
-    // Policy info
-    lines.push(`**Policy:** ${violation.policy_name}`);
-    if (violation.category) {
-        lines.push(`**Category:** ${violation.category}`);
+    // Severity + policy metadata
+    const severityLabel = `${capitalizeFirstCharacter(violation.severity)} Severity`;
+    lines.push(`${(0, severity_1.getSeverityIcon)(violation.severity)} ${severityLabel} / **Policy:** ${violation.policy_name}`);
+    lines.push('');
+    // Explanation only
+    const body = formatExplanation(violation.explanation || '');
+    if (body) {
+        lines.push(body);
     }
     lines.push('');
-    // Message
-    lines.push(`**Issue:** ${violation.message}`);
-    lines.push('');
-    // Explanation
-    if (violation.explanation) {
-        lines.push('**Why this matters:**');
-        lines.push(violation.explanation);
-        lines.push('');
-    }
-    // Remediation
-    if (violation.remediation) {
-        lines.push('**How to fix:**');
-        lines.push(violation.remediation);
-        lines.push('');
-    }
     // Suggested fix (GitHub suggestion block)
     if (violation.metadata.suggested_fix) {
-        lines.push('**Suggested fix:**');
         lines.push(buildSuggestionBlock(violation.metadata.suggested_fix));
         lines.push('');
     }
-    // CWE reference
-    if (violation.metadata.cwe_id) {
-        // Extract just the number (handle both "89" and "CWE-89" formats)
-        const cweNumber = violation.metadata.cwe_id.replace(/^CWE-/i, '');
-        lines.push(`**Reference:** [CWE-${cweNumber}](https://cwe.mitre.org/data/definitions/${cweNumber}.html)`);
-        lines.push('');
+    // Action buttons: Cursor + Dashboard
+    const buttons = [];
+    buttons.push(buildCursorDeeplinkHtml(violation));
+    if (violation.id) {
+        buttons.push(buildDashboardDeeplinkHtml(violation));
     }
-    // Cursor deeplink button
-    lines.push(buildCursorDeeplinkHtml(violation));
+    lines.push(`<p>${buttons.join('&nbsp;&nbsp;')}</p>`);
+    lines.push('');
     // Embed violation ID for webhook handler to link comment back to violation
     if (violation.id) {
         lines.push('');
         lines.push(`<!-- asymptote:violation_id=${violation.id} -->`);
     }
     return lines.join('\n');
+}
+/**
+ * Format a fallback comment for violations that lack valid file/line locations.
+ * Posted as a regular issue comment in the PR conversation timeline.
+ */
+function formatFallbackComment(violations) {
+    const lines = [];
+    lines.push('## Asymptote Security Findings');
+    lines.push('');
+    lines.push(`The following ${violations.length === 1 ? 'violation was' : `${violations.length} violations were`} detected but could not be pinned to a specific line in the diff:`);
+    lines.push('');
+    for (const violation of violations) {
+        const badge = (0, severity_1.getSeverityBadge)(violation.severity);
+        lines.push(`<details>`);
+        lines.push(`<summary>${badge} ${violation.policy_name}${violation.location.file ? ` — <code>${violation.location.file}</code>` : ''}</summary>`);
+        lines.push('');
+        lines.push(`**Issue:** ${violation.message}`);
+        lines.push('');
+        if (violation.remediation) {
+            lines.push(`**How to fix:** ${violation.remediation}`);
+            lines.push('');
+        }
+        if (violation.metadata.cwe_id) {
+            const cweNumber = violation.metadata.cwe_id.replace(/^CWE-/i, '');
+            lines.push(`**Reference:** [CWE-${cweNumber}](https://cwe.mitre.org/data/definitions/${cweNumber}.html)`);
+            lines.push('');
+        }
+        lines.push(`</details>`);
+        lines.push('');
+    }
+    return lines.join('\n');
+}
+function capitalizeFirstCharacter(value) {
+    if (!value) {
+        return value;
+    }
+    return value.replace(/^(\s*)(\S)/, (_, leadingWhitespace, firstChar) => `${leadingWhitespace}${firstChar.toUpperCase()}`);
+}
+function formatExplanation(explanation) {
+    if (!explanation) {
+        return '';
+    }
+    return explanation.replace(/`([^`\n]+)`/g, (_match, code) => {
+        return `<code>${escapeHtml(code)}</code>`;
+    });
+}
+function escapeHtml(value) {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+/**
+ * Resolve outdated Asymptote review threads on a PR.
+ * GitHub marks threads as "outdated" when the referenced lines change.
+ * Resolving them triggers the pull_request_review_thread webhook which
+ * the backend uses to mark violations as remediated.
+ */
+async function resolveOutdatedThreads(octokit, owner, repo, prNumber) {
+    const query = `
+    query($owner: String!, $repo: String!, $prNumber: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $prNumber) {
+          reviewThreads(first: 100) {
+            nodes {
+              id
+              isResolved
+              isOutdated
+              comments(first: 1) {
+                nodes {
+                  body
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+    const result = await octokit.graphql(query, { owner, repo, prNumber });
+    const threads = result.repository.pullRequest.reviewThreads.nodes;
+    // Identify Asymptote threads by the violation_id marker embedded in comment
+    // body, which works regardless of auth method (github-actions[bot] or
+    // asymptote-security[bot])
+    const ASYMPTOTE_MARKER = /<!-- asymptote:violation_id=/;
+    const outdatedThreads = threads.filter((t) => t.isOutdated &&
+        !t.isResolved &&
+        ASYMPTOTE_MARKER.test(t.comments.nodes[0]?.body ?? ''));
+    if (outdatedThreads.length === 0) {
+        core.info('No outdated Asymptote threads to resolve');
+        return;
+    }
+    core.info(`Resolving ${outdatedThreads.length} outdated Asymptote thread(s)`);
+    let resolved = 0;
+    for (const thread of outdatedThreads) {
+        try {
+            await octokit.graphql(`mutation($threadId: ID!) {
+          resolveReviewThread(input: { threadId: $threadId }) {
+            thread { id }
+          }
+        }`, { threadId: thread.id });
+            resolved++;
+        }
+        catch (error) {
+            core.warning(`Failed to resolve thread ${thread.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    core.info(`Resolved ${resolved}/${outdatedThreads.length} outdated thread(s)`);
 }
 
 
@@ -32119,6 +32293,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getPRDiff = getPRDiff;
+exports.getIncrementalDiff = getIncrementalDiff;
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const glob_1 = __nccwpck_require__(339);
@@ -32172,6 +32347,56 @@ async function getPRDiff(octokit, excludePaths = []) {
         files,
         prNumber,
         commitSha,
+        baseSha,
+    };
+}
+async function getIncrementalDiff(octokit, beforeSha, afterSha, excludePaths = []) {
+    const { owner, repo } = github.context.repo;
+    const prNumber = github.context.payload.pull_request?.number;
+    if (!prNumber) {
+        throw new Error('Could not determine PR number from context');
+    }
+    const baseSha = github.context.payload.pull_request?.base?.sha;
+    if (!baseSha) {
+        throw new Error('Could not determine base SHA from PR context');
+    }
+    core.debug(`Fetching incremental diff (${beforeSha}...${afterSha})`);
+    // Fetch the diff between the two commits
+    const compareResponse = await octokit.rest.repos.compareCommitsWithBasehead({
+        owner,
+        repo,
+        basehead: `${beforeSha}...${afterSha}`,
+        mediaType: {
+            format: 'diff',
+        },
+    });
+    let diff = compareResponse.data;
+    // Fetch comparison again for file metadata (JSON format)
+    const filesResponse = await octokit.rest.repos.compareCommitsWithBasehead({
+        owner,
+        repo,
+        basehead: `${beforeSha}...${afterSha}`,
+    });
+    let files = (filesResponse.data.files || []).map((file) => ({
+        path: file.filename,
+        language: getLanguageFromFilename(file.filename),
+    }));
+    // Filter out excluded paths
+    if (excludePaths.length > 0) {
+        const originalFileCount = files.length;
+        files = files.filter((f) => !(0, glob_1.matchesAnyPattern)(f.path, excludePaths));
+        diff = (0, glob_1.filterDiff)(diff, excludePaths);
+        const excludedCount = originalFileCount - files.length;
+        if (excludedCount > 0) {
+            core.info(`Excluded ${excludedCount} files matching exclude patterns`);
+        }
+    }
+    core.info(`Fetched incremental diff with ${files.length} files to scan`);
+    return {
+        diff,
+        files,
+        prNumber,
+        commitSha: afterSha,
         baseSha,
     };
 }
@@ -32266,8 +32491,10 @@ async function run() {
         core.setSecret(config.apiKey);
         core.info('Asymptote Security Scan starting...');
         core.debug(`API URL: ${config.apiUrl}`);
-        core.debug(`Fail on: ${config.failOn}`);
-        core.debug(`Comment on: ${config.commentOn}`);
+        const client = new client_1.AsymptoteClient({
+            apiKey: config.apiKey,
+            baseUrl: config.apiUrl,
+        });
         // 2. Verify PR context
         if (github.context.eventName !== 'pull_request') {
             core.setFailed(`This action only runs on pull_request events. Current event: ${github.context.eventName}`);
@@ -32280,12 +32507,51 @@ async function run() {
             return;
         }
         const octokit = github.getOctokit(githubToken);
-        // 4. Get PR diff
+        try {
+            const integration = await client.getRepositoryIntegrationMode(github.context.repo.owner, github.context.repo.repo);
+            if ((0, client_1.shouldSkipLegacyActionForIntegration)(integration)) {
+                core.info('Repository is configured for GitHub App PR reviews; exiting legacy action without posting comments or checks.');
+                core.setOutput('decision', 'allow');
+                core.setOutput('total_violations', 0);
+                core.setOutput('critical_count', 0);
+                core.setOutput('high_count', 0);
+                core.setOutput('medium_count', 0);
+                return;
+            }
+        }
+        catch (error) {
+            core.warning(`Failed to look up repository integration mode; continuing with legacy action path. ${error instanceof Error ? error.message : String(error)}`);
+        }
+        // 4. Get PR diff (incremental on synchronize, full otherwise)
+        const action = github.context.payload.action;
+        const before = github.context.payload.before;
         core.info('Fetching PR diff...');
         if (config.excludePaths.length > 0) {
             core.info(`Excluding paths: ${config.excludePaths.join(', ')}`);
         }
-        const diffResult = await (0, diff_1.getPRDiff)(octokit, config.excludePaths);
+        let diffResult;
+        const commitSha = github.context.payload.pull_request?.head?.sha;
+        if (action === 'synchronize' && before && commitSha) {
+            core.info(`Incremental diff: ${before}...${commitSha}`);
+            diffResult = await (0, diff_1.getIncrementalDiff)(octokit, before, commitSha, config.excludePaths);
+        }
+        else {
+            diffResult = await (0, diff_1.getPRDiff)(octokit, config.excludePaths);
+        }
+        // Auto-resolve outdated Asymptote threads on synchronize (before empty-diff
+        // check so threads are resolved even when the incremental diff is empty)
+        if (action === 'synchronize') {
+            const { owner, repo } = github.context.repo;
+            const prNumber = github.context.payload.pull_request?.number;
+            if (prNumber) {
+                try {
+                    await (0, comments_1.resolveOutdatedThreads)(octokit, owner, repo, prNumber);
+                }
+                catch (error) {
+                    core.warning(`Failed to resolve outdated threads: ${error instanceof Error ? error.message : String(error)}`);
+                }
+            }
+        }
         if (!diffResult.diff || diffResult.diff.trim().length === 0) {
             core.info('No changes detected in PR, skipping evaluation');
             core.setOutput('decision', 'allow');
@@ -32296,12 +32562,53 @@ async function run() {
             return;
         }
         core.info(`PR #${diffResult.prNumber}: ${diffResult.files.length} files changed`);
+        // 4b. Get PR author email from webhook payload
+        const prAuthorLogin = github.context.payload.pull_request?.user?.login;
+        core.info(`PR author login: ${prAuthorLogin || '(not found)'}`);
+        let prAuthor;
+        if (prAuthorLogin) {
+            prAuthor = prAuthorLogin;
+            if (diffResult.prNumber) {
+                try {
+                    const commits = await octokit.rest.pulls.listCommits({
+                        owner: github.context.repo.owner,
+                        repo: github.context.repo.repo,
+                        pull_number: diffResult.prNumber,
+                        per_page: 100,
+                    });
+                    const emailCounts = new Map();
+                    for (const commit of commits.data) {
+                        const email = commit.commit?.author?.email;
+                        if (email) {
+                            emailCounts.set(email, (emailCounts.get(email) || 0) + 1);
+                        }
+                    }
+                    let topEmail;
+                    let topCount = 0;
+                    for (const [email, count] of emailCounts) {
+                        if (count > topCount) {
+                            topEmail = email;
+                            topCount = count;
+                        }
+                    }
+                    if (topEmail) {
+                        prAuthor = topEmail;
+                    }
+                }
+                catch {
+                    // prAuthor already set to prAuthorLogin above
+                }
+            }
+        }
+        core.info(`PR author resolved to: ${prAuthor ? '(resolved, masked)' : '(not resolved)'}`);
+        if (!prAuthor) {
+            prAuthor = github.context.actor;
+            core.info('Using github.context.actor as fallback');
+        }
+        // Mask the resolved author value so it is redacted from CI logs
+        core.setSecret(prAuthor);
         // 5. Call Asymptote API
         core.info('Submitting diff for evaluation...');
-        const client = new client_1.AsymptoteClient({
-            apiKey: config.apiKey,
-            baseUrl: config.apiUrl,
-        });
         let result;
         try {
             result = await client.evaluateWithPolling({
@@ -32316,6 +32623,7 @@ async function run() {
                     tool: 'github-action',
                     pr_number: diffResult.prNumber,
                     commit_sha: diffResult.commitSha,
+                    pr_author: prAuthor,
                 },
             });
         }
@@ -32338,9 +32646,8 @@ async function run() {
         const decision = result.decision || 'allow';
         const counts = (0, severity_1.countBySeverity)(violations);
         core.info(`Evaluation complete: ${decision} (${violations.length} violations)`);
-        // 5b. Generate suggested fixes for high/critical violations
-        const commentableViolations = (0, severity_1.filterByThreshold)(violations, config.commentOn);
-        if (commentableViolations.length > 0) {
+        // 5b. Generate suggested fixes for violations
+        if (violations.length > 0) {
             core.info('Generating suggested fixes...');
             const fixes = await client.getSuggestedFixes(result.evaluation_id, diffResult.diff);
             if (fixes.length > 0) {
@@ -32361,19 +32668,18 @@ async function run() {
             }
         }
         // 6. Post review comments
-        await (0, comments_1.postViolationComments)(octokit, violations, diffResult.commitSha, config.commentOn);
+        await (0, comments_1.postViolationComments)(octokit, violations, diffResult.commitSha);
         // 7. Create check run with annotations
-        await (0, checks_1.createCheckRun)(octokit, result, diffResult.commitSha, config.failOn);
+        await (0, checks_1.createCheckRun)(octokit, result, diffResult.commitSha);
         // 8. Set outputs
         core.setOutput('decision', decision);
         core.setOutput('total_violations', violations.length);
         core.setOutput('critical_count', counts.critical);
         core.setOutput('high_count', counts.high);
         core.setOutput('medium_count', counts.medium);
-        // 9. Fail if threshold exceeded
-        if ((0, severity_1.shouldFail)(violations, config.failOn)) {
-            const failingViolations = (0, severity_1.filterByThreshold)(violations, config.failOn);
-            core.setFailed(`Security check failed: ${failingViolations.length} violation(s) at or above ${config.failOn} severity`);
+        // 9. Fail if any violations exist
+        if (violations.length > 0) {
+            core.setFailed(`Security check failed: ${violations.length} violation(s) found`);
         }
         else {
             core.info('Security check passed');
@@ -32466,49 +32772,9 @@ function filterDiff(diff, excludePatterns) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.SEVERITY_ORDER = void 0;
-exports.getSeverityPriority = getSeverityPriority;
-exports.meetsThreshold = meetsThreshold;
-exports.filterByThreshold = filterByThreshold;
-exports.shouldFail = shouldFail;
 exports.countBySeverity = countBySeverity;
 exports.getSeverityBadge = getSeverityBadge;
-exports.parseSeverity = parseSeverity;
-/**
- * Severity levels in order from most to least severe
- */
-exports.SEVERITY_ORDER = [
-    'critical',
-    'high',
-    'medium',
-    'low',
-    'info',
-];
-/**
- * Get the numeric priority of a severity level (lower = more severe)
- */
-function getSeverityPriority(severity) {
-    const index = exports.SEVERITY_ORDER.indexOf(severity);
-    return index === -1 ? exports.SEVERITY_ORDER.length : index;
-}
-/**
- * Check if a violation meets the minimum severity threshold
- */
-function meetsThreshold(violationSeverity, threshold) {
-    return getSeverityPriority(violationSeverity) <= getSeverityPriority(threshold);
-}
-/**
- * Filter violations that meet the minimum severity threshold
- */
-function filterByThreshold(violations, threshold) {
-    return violations.filter((v) => meetsThreshold(v.severity, threshold));
-}
-/**
- * Check if any violations meet the failure threshold
- */
-function shouldFail(violations, failOnThreshold) {
-    return violations.some((v) => meetsThreshold(v.severity, failOnThreshold));
-}
+exports.getSeverityIcon = getSeverityIcon;
 /**
  * Count violations by severity
  */
@@ -32541,14 +32807,17 @@ function getSeverityBadge(severity) {
     return badges[severity] || severity;
 }
 /**
- * Validate severity string input
+ * Get severity icon for display when the label is rendered separately.
  */
-function parseSeverity(input) {
-    const normalized = input.toLowerCase().trim();
-    if (exports.SEVERITY_ORDER.includes(normalized)) {
-        return normalized;
-    }
-    throw new Error(`Invalid severity: ${input}. Must be one of: ${exports.SEVERITY_ORDER.join(', ')}`);
+function getSeverityIcon(severity) {
+    const icons = {
+        critical: '🔴',
+        high: '🟠',
+        medium: '🟡',
+        low: '🔵',
+        info: 'ℹ️',
+    };
+    return icons[severity] || severity;
 }
 
 

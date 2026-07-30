@@ -1,11 +1,16 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { getConfig } from './config';
-import { AsymptoteClient, RateLimitError, TimeoutError } from './api/client';
-import { getPRDiff } from './github/diff';
-import { postViolationComments } from './github/comments';
+import {
+  AsymptoteClient,
+  RateLimitError,
+  shouldSkipLegacyActionForIntegration,
+  TimeoutError,
+} from './api/client';
+import { getPRDiff, getIncrementalDiff } from './github/diff';
+import { postViolationComments, resolveOutdatedThreads } from './github/comments';
 import { createCheckRun } from './github/checks';
-import { shouldFail, countBySeverity, filterByThreshold } from './utils/severity';
+import { countBySeverity } from './utils/severity';
 
 async function run(): Promise<void> {
   try {
@@ -15,8 +20,11 @@ async function run(): Promise<void> {
 
     core.info('Asymptote Security Scan starting...');
     core.debug(`API URL: ${config.apiUrl}`);
-    core.debug(`Fail on: ${config.failOn}`);
-    core.debug(`Comment on: ${config.commentOn}`);
+
+    const client = new AsymptoteClient({
+      apiKey: config.apiKey,
+      baseUrl: config.apiUrl,
+    });
 
     // 2. Verify PR context
     if (github.context.eventName !== 'pull_request') {
@@ -36,12 +44,67 @@ async function run(): Promise<void> {
     }
     const octokit = github.getOctokit(githubToken);
 
-    // 4. Get PR diff
+    try {
+      const integration = await client.getRepositoryIntegrationMode(
+        github.context.repo.owner,
+        github.context.repo.repo
+      );
+      if (shouldSkipLegacyActionForIntegration(integration)) {
+        core.info(
+          'Repository is configured for GitHub App PR reviews; exiting legacy action without posting comments or checks.'
+        );
+        core.setOutput('decision', 'allow');
+        core.setOutput('total_violations', 0);
+        core.setOutput('critical_count', 0);
+        core.setOutput('high_count', 0);
+        core.setOutput('medium_count', 0);
+        return;
+      }
+    } catch (error) {
+      core.warning(
+        `Failed to look up repository integration mode; continuing with legacy action path. ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    // 4. Get PR diff (incremental on synchronize, full otherwise)
+    const action = github.context.payload.action;
+    const before = github.context.payload.before;
+
     core.info('Fetching PR diff...');
     if (config.excludePaths.length > 0) {
       core.info(`Excluding paths: ${config.excludePaths.join(', ')}`);
     }
-    const diffResult = await getPRDiff(octokit, config.excludePaths);
+
+    let diffResult;
+    const commitSha = github.context.payload.pull_request?.head?.sha;
+
+    if (action === 'synchronize' && before && commitSha) {
+      core.info(`Incremental diff: ${before}...${commitSha}`);
+      diffResult = await getIncrementalDiff(
+        octokit,
+        before,
+        commitSha,
+        config.excludePaths
+      );
+    } else {
+      diffResult = await getPRDiff(octokit, config.excludePaths);
+    }
+
+    // Auto-resolve outdated Asymptote threads on synchronize (before empty-diff
+    // check so threads are resolved even when the incremental diff is empty)
+    if (action === 'synchronize') {
+      const { owner, repo } = github.context.repo;
+      const prNumber = github.context.payload.pull_request?.number;
+      if (prNumber) {
+        try {
+          await resolveOutdatedThreads(octokit, owner, repo, prNumber);
+        } catch (error) {
+          core.warning(
+            `Failed to resolve outdated threads: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    }
 
     if (!diffResult.diff || diffResult.diff.trim().length === 0) {
       core.info('No changes detected in PR, skipping evaluation');
@@ -57,12 +120,58 @@ async function run(): Promise<void> {
       `PR #${diffResult.prNumber}: ${diffResult.files.length} files changed`
     );
 
+    // 4b. Get PR author email from webhook payload
+    const prAuthorLogin =
+      github.context.payload.pull_request?.user?.login as string | undefined;
+    core.info(`PR author login: ${prAuthorLogin || '(not found)'}`);
+    let prAuthor: string | undefined;
+    if (prAuthorLogin) {
+      prAuthor = prAuthorLogin;
+      if (diffResult.prNumber) {
+        try {
+          const commits = await octokit.rest.pulls.listCommits({
+            owner: github.context.repo.owner,
+            repo: github.context.repo.repo,
+            pull_number: diffResult.prNumber,
+            per_page: 100,
+          });
+          const emailCounts = new Map<string, number>();
+          for (const commit of commits.data) {
+            const email = commit.commit?.author?.email;
+            if (email) {
+              emailCounts.set(email, (emailCounts.get(email) || 0) + 1);
+            }
+          }
+          let topEmail: string | undefined;
+          let topCount = 0;
+          for (const [email, count] of emailCounts) {
+            if (count > topCount) {
+              topEmail = email;
+              topCount = count;
+            }
+          }
+          if (topEmail) {
+            prAuthor = topEmail;
+          }
+        } catch {
+          // prAuthor already set to prAuthorLogin above
+        }
+      }
+    }
+    core.info(
+      `PR author resolved to: ${prAuthor ? '(resolved, masked)' : '(not resolved)'}`
+    );
+
+    if (!prAuthor) {
+      prAuthor = github.context.actor;
+      core.info('Using github.context.actor as fallback');
+    }
+
+    // Mask the resolved author value so it is redacted from CI logs
+    core.setSecret(prAuthor);
+
     // 5. Call Asymptote API
     core.info('Submitting diff for evaluation...');
-    const client = new AsymptoteClient({
-      apiKey: config.apiKey,
-      baseUrl: config.apiUrl,
-    });
 
     let result;
     try {
@@ -78,6 +187,7 @@ async function run(): Promise<void> {
           tool: 'github-action',
           pr_number: diffResult.prNumber,
           commit_sha: diffResult.commitSha,
+          pr_author: prAuthor,
         },
       });
     } catch (error) {
@@ -108,9 +218,8 @@ async function run(): Promise<void> {
       `Evaluation complete: ${decision} (${violations.length} violations)`
     );
 
-    // 5b. Generate suggested fixes for high/critical violations
-    const commentableViolations = filterByThreshold(violations, config.commentOn);
-    if (commentableViolations.length > 0) {
+    // 5b. Generate suggested fixes for violations
+    if (violations.length > 0) {
       core.info('Generating suggested fixes...');
       const fixes = await client.getSuggestedFixes(
         result.evaluation_id,
@@ -136,20 +245,10 @@ async function run(): Promise<void> {
     }
 
     // 6. Post review comments
-    await postViolationComments(
-      octokit,
-      violations,
-      diffResult.commitSha,
-      config.commentOn
-    );
+    await postViolationComments(octokit, violations, diffResult.commitSha);
 
     // 7. Create check run with annotations
-    await createCheckRun(
-      octokit,
-      result,
-      diffResult.commitSha,
-      config.failOn
-    );
+    await createCheckRun(octokit, result, diffResult.commitSha);
 
     // 8. Set outputs
     core.setOutput('decision', decision);
@@ -158,11 +257,10 @@ async function run(): Promise<void> {
     core.setOutput('high_count', counts.high);
     core.setOutput('medium_count', counts.medium);
 
-    // 9. Fail if threshold exceeded
-    if (shouldFail(violations, config.failOn)) {
-      const failingViolations = filterByThreshold(violations, config.failOn);
+    // 9. Fail if any violations exist
+    if (violations.length > 0) {
       core.setFailed(
-        `Security check failed: ${failingViolations.length} violation(s) at or above ${config.failOn} severity`
+        `Security check failed: ${violations.length} violation(s) found`
       );
     } else {
       core.info('Security check passed');
